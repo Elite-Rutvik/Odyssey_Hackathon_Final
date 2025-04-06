@@ -16,6 +16,7 @@ load_dotenv()
 os.environ["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY")
 os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API_KEY")
 os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGCHAIN_PROJECT")
+os.environ["LANGCHAIN_TRACING_V2"] = "true" 
 
 st.set_page_config(page_title="RFP Analysis Dashboard", layout="wide")
 st.markdown("""
@@ -35,66 +36,88 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
+company_chunk = {
+    "Company Length of Existence": "9 years",
+    "Years of Experience in Temporary Staffing": "7 years",
+    "DUNS Number": "07-842-1490",
+    "CAGE Code": "8J4T7",
+    "SAM.gov Registration Date": "03/01/2022",
+    "NAICS Codes": "561320 – Temporary Help Services; 541611 – Admin Management",
+    "State of Incorporation": "Delaware",
+    "Bank Letter of Creditworthiness": "Not Available",
+    "State Registration Number": "SRN-DE-0923847",
+    "Services Provided": "Administrative, IT, Legal & Credentialing Staffing",
+    "Business Structure": "Limited Liability Company (LLC)",
+    "W-9 Form": "Attached (TIN: 47-6392011)",
+    "Certificate of Insurance": "Travelers Insurance, Policy #TX-884529-A; includes Workers' Comp, Liability, and Auto",
+    "Licenses": "Texas Employment Agency License #TXEA-34892",
+    "Historically Underutilized Business/DBE Status": "Not certified.",
+    "Key Personnel – Project Manager": "Ramesh Iyer",
+    "Key Personnel – Technical Lead": "Sarah Collins",
+    "Key Personnel – Security Auditor": "James Wu",
+    "MBE Certification": "NO"
+}
+
 st.title("📄 AI-Powered RFP Analyzer")
 st.caption("Analyze your RFP and company profile in one click")
 
 # File uploads
-col1, col2 = st.columns(2)
-with col1:
-    company_file = st.file_uploader("📁 Upload Company Profile (DOCX)", type=["docx"])
-with col2:
-    rfp_file = st.file_uploader("📁 Upload RFP Document (PDF)", type=["pdf"])
 
-if company_file and rfp_file:
-    with open("company.docx", "wb") as f:
-        f.write(company_file.read())
+rfp_file = st.file_uploader("📁 Upload RFP Document (PDF)", type=["pdf"])
+
+if rfp_file:
     with open("rfp.pdf", "wb") as f:
         f.write(rfp_file.read())
 
     st.success("✅ Files uploaded. Analyzing...")
 
-    # Load and split documents
-    company_docs = Docx2txtLoader("company.docx").load()
+    # Load and split documents 
     rfp_docs = PyPDFLoader("rfp.pdf").load()
-    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
-    company_chunks = splitter.split_documents(company_docs)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100) 
     rfp_chunks = splitter.split_documents(rfp_docs)
 
     # Embedding and vectorstore
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
-    company_vs = FAISS.from_documents(company_chunks, embeddings)
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004") 
     rfp_vs = FAISS.from_documents(rfp_chunks, embeddings)
-
-    company_relevant = company_vs.similarity_search("company certifications, registration, past performance", k=3)
+ 
     rfp_relevant = rfp_vs.similarity_search("eligibility criteria, mandatory qualifications", k=3)
 
-    rfp_text = "\n".join([doc.page_content for doc in rfp_relevant])
-    company_text = "\n".join([doc.page_content for doc in company_relevant])
+    rfp_text = "\n".join([doc.page_content for doc in rfp_relevant]) 
 
     # LLM and Prompt Templates
     llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash-8b", streaming=True)
     with open("evaluation_guidelines.txt", "r") as f:
         evaluation_guidelines=f.read()
 
-    eligibility_prompt = PromptTemplate.from_template("""
-    You are an expert in compliance and eligibility analysis for RFPs.
-    Determine if the company is eligible to respond to the RFP based on the following criteria.
-    mandatory qualifications such as:
-    - Required experience 
-    - Certifications
-    - Licenses or registrations
-                                                      
-                                                      
-    ## RFP:                                                  
-    {rfp_chunk}
+    eligibility_prompt = PromptTemplate.from_template("""You are an expert bid analyzer. Please analyze this bid document text and provide a structured analysis:
 
-    ### Company Profile:
-    {company_chunk}
+{rfp_chunk}
 
-    Respond in the format:
-    ✅ Eligible: [Reason] even if  company structure, licenses, and personnel matches .
-    or
-    ❌ Not Eligible: [Reason]
+Provide your analysis in the following format:
+
+REQUIRED QUALIFICATIONS:
+- List each qualification requirement
+- If none found, state "No specific qualifications mentioned"
+
+REQUIRED CERTIFICATIONS:
+- List each certification requirement
+- If none found, state "No specific certifications mentioned"
+
+REQUIRED EXPERIENCE:
+- List each experience requirement
+- If none found, state "No specific experience requirements mentioned"
+
+MISSING OR UNCLEAR REQUIREMENTS:
+- List any vague or missing requirements
+- If none found, state "No missing or unclear requirements identified"
+
+ELIGIBILITY FLAGS:
+- List any critical requirements that could disqualify a bid
+- If none found, state "No eligibility issues identified"
+ 
+THIS RFP IS :*ELIGIBLE or NOT ELIGIBLE* FOR BID
+ 
+
     """)
 
     gap_prompt = PromptTemplate.from_template("""
@@ -122,18 +145,32 @@ if company_file and rfp_file:
     - [List with suggestions to fulfill or address each gap]
     """)
 
-    submission_prompt = PromptTemplate.from_template("""
-    You are a compliance assistant creating a submission checklist based on RFP instructions.
+    submission_prompt = PromptTemplate.from_template("""You are an expert RFP analyst. Please analyze this document and provide a structured checklist of submission requirements:
 
-    From the text below, extract:
-    - Document format (e.g., font, layout, margins)
-    - Required attachments
-    - Submission method and deadline
+{rfp_chunk}
 
-    ### RFP Submission Instructions:
-    {rfp_chunk}
+Provide your analysis in the following format:
 
-    Return as a checklist.
+DOCUMENT FORMAT REQUIREMENTS:
+Provide a concise paragraph describing any formatting requirements found in the document, including page limits, font specifications, spacing, margins, or other formatting guidelines. If no specific format requirements are mentioned, state "No specific format requirements mentioned in the document."
+
+REQUIRED ATTACHMENTS:
+- List each required form/attachment
+- Specify form numbers if provided
+- Specify if original signatures required
+- If none found, state "No specific attachments mentioned"
+
+SUBMISSION FORMAT:
+- Number of copies required
+- Electronic/Physical submission
+- File format for electronic submission
+- If none specified, state "No specific format requirements mentioned"
+
+ADDITIONAL REQUIREMENTS:
+- Any other formatting or submission requirements
+- If none found, state "No additional requirements identified"
+
+Please be specific and precise in listing each requirement.
     """)
 
     risk_prompt = PromptTemplate.from_template("""
@@ -161,13 +198,13 @@ if company_file and rfp_file:
     with st.expander("✅ Eligibility & Compliance Checker"):
         st.info("Analyzing eligibility based on compliance requirements...")
         with st.spinner("🧠 Evaluating eligibility..."):
-            eligibility_result = eligibility_chain.run({"rfp_chunk": rfp_text, "company_chunk": company_text, "guidelines": evaluation_guidelines})
+            eligibility_result = eligibility_chain.run({"rfp_chunk": rfp_text, "company_chunk": company_chunk, "guidelines": evaluation_guidelines})
         st.write(eligibility_result)
 
     with st.expander("📄 Criteria Extractor & Gap Analyzer"):
         st.info("Comparing company qualifications to mandatory RFP criteria...")
         with st.spinner("🧠 Evaluating eligibility..."):
-            gap_result = gap_chain.run({"rfp_chunk": rfp_text, "company_chunk": company_text,"guidelines": evaluation_guidelines})
+            gap_result = gap_chain.run({"rfp_chunk": rfp_text, "company_chunk": company_chunk,"guidelines": evaluation_guidelines})
         st.write(gap_result)
 
     with st.expander("📋Submission Checklist Generator"):
@@ -192,8 +229,8 @@ if company_file and rfp_file:
         #         pdf.multi_cell(0, 10, line)
         #     pdf.output(pdf_file)
 
-        #     st.download_button("📥 Download Checklist (CSV)", data=open(csv_file, "rb",encoding="latin-1"), file_name=csv_file, mime="text/csv")
-        #     st.download_button("📥 Download Checklist (PDF)", data=open(pdf_file, "rb",encoding="latin-1"), file_name=pdf_file, mime="application/pdf")
+        #     st.download_button("📥 Download Checklist (CSV)", data=open(csv_file, "rb" ), file_name=csv_file, mime="text/csv")
+        #     st.download_button("📥 Download Checklist (PDF)", data=open(pdf_file, "rb" ), file_name=pdf_file, mime="application/pdf")
 
     with st.expander("⚠️ Risk Analyzer"):
         st.info("Detecting legal and contractual risks in the RFP...")
