@@ -15,9 +15,7 @@ from typing import Any, List, Optional
 from langchain_core.pydantic_v1 import BaseModel, Field, PrivateAttr
 
 # Neo4j credentials - Updated URI format
-NEO4J_URI = "neo4j+s://3f57e783.databases.neo4j.io"
-NEO4J_USERNAME = "neo4j"
-NEO4J_PASSWORD = "WFjhW_fw7H5d-zKym-dKIaupKTzHaHnycLCzOorHYFk"
+
 
 # Initialize Google Gemini model with new client
 genai.configure(api_key="")
