@@ -1,124 +1,201 @@
-import streamlit as st 
-from PyPDF2 import PdfReader
+# app.py
+
+import streamlit as st
+from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-import os
-from io import BytesIO
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-import google.generativeai as genai
-from langchain.vectorstores import FAISS
+from langchain_community.vectorstores import FAISS
+from langchain_google_genai.embeddings import GoogleGenerativeAIEmbeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.chains.question_answering import load_qa_chain
+from langchain.chains import LLMChain
 from langchain.prompts import PromptTemplate
+import pandas as pd
+from fpdf import FPDF
+import os
 from dotenv import load_dotenv
-from docx import Document 
+load_dotenv()       
+os.environ["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY")
+os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API_KEY")
+os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGCHAIN_PROJECT")
 
-load_dotenv()
+st.set_page_config(page_title="RFP Analysis Dashboard", layout="wide")
+st.markdown("""
+    <style>
+    .main {
+        background-color: #f8f9fa;
+    }
+    .stApp {
+        font-family: 'Segoe UI', sans-serif;
+    }
+    .css-1d391kg, .css-1v0mbdj {
+        background-color: #ffffff;
+        border-radius: 12px;
+        padding: 20px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    }
+    </style>
+""", unsafe_allow_html=True)
 
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+st.title("📄 AI-Powered RFP Analyzer")
+st.caption("Analyze your RFP and company profile in one click")
 
-def get_pdf_text(pdf_docs):
-    text = ""
-    for pdf in pdf_docs:
-        pdf_reader = PdfReader(BytesIO(pdf.read()))  
-        for page in pdf_reader.pages:
-            text += page.extract_text()
-    return text
+# File uploads
+col1, col2 = st.columns(2)
+with col1:
+    company_file = st.file_uploader("📁 Upload Company Profile (DOCX)", type=["docx"])
+with col2:
+    rfp_file = st.file_uploader("📁 Upload RFP Document (PDF)", type=["pdf"])
 
-def get_text_chunks(text):
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=10000, chunk_overlap=1000)
-    chunks = text_splitter.split_text(text)
-    return chunks
+if company_file and rfp_file:
+    with open("company.docx", "wb") as f:
+        f.write(company_file.read())
+    with open("rfp.pdf", "wb") as f:
+        f.write(rfp_file.read())
 
-def get_vector_store(text_chunks):
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
-    vector_store.save_local("faiss_index")
+    st.success("✅ Files uploaded. Analyzing...")
 
-def get_conversational_chain():
-    prompt_template = """
-    Answer the question as detailed as possible from the provided context, make sure to provide all the details, if the answer is not in the 
-    provided context just say, "answer is not available in the context", don't provide the wrong answer.
-    Generate questions based on the context only which can contain sub questions in the same topic.
-    Don't generate questions that cannot be answered from the given context.
-    Context:\n {context}?\n
-    Question: \n{question}\n 
+    # Load and split documents
+    company_docs = Docx2txtLoader("company.docx").load()
+    rfp_docs = PyPDFLoader("rfp.pdf").load()
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+    company_chunks = splitter.split_documents(company_docs)
+    rfp_chunks = splitter.split_documents(rfp_docs)
 
-    Answer:
-    """
-    model = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.3)
-    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
-    chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
+    # Embedding and vectorstore
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+    company_vs = FAISS.from_documents(company_chunks, embeddings)
+    rfp_vs = FAISS.from_documents(rfp_chunks, embeddings)
 
-    return chain
+    company_relevant = company_vs.similarity_search("company certifications, registration, past performance", k=3)
+    rfp_relevant = rfp_vs.similarity_search("eligibility criteria, mandatory qualifications", k=3)
 
-def user_input(user_question):
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+    rfp_text = "\n".join([doc.page_content for doc in rfp_relevant])
+    company_text = "\n".join([doc.page_content for doc in company_relevant])
 
-    new_db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
+    # LLM and Prompt Templates
+    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash-8b", streaming=True)
+    with open("evaluation_guidelines.txt", "r") as f:
+        evaluation_guidelines=f.read()
 
-    docs = new_db.similarity_search(user_question)
+    eligibility_prompt = PromptTemplate.from_template("""
+    You are an expert in compliance and eligibility analysis for RFPs.
+    Determine if the company is eligible to respond to the RFP based on the following criteria.
+    mandatory qualifications such as:
+    - Required experience 
+    - Certifications
+    - Licenses or registrations
+                                                      
+                                                      
+    ## RFP:                                                  
+    {rfp_chunk}
+
+    ### Company Profile:
+    {company_chunk}
+
+    Respond in the format:
+    ✅ Eligible: [Reason] even if  company structure, licenses, and personnel matches .
+    or
+    ❌ Not Eligible: [Reason]
+    """)
+
+    gap_prompt = PromptTemplate.from_template("""
+    You are a proposal analyst identifying gaps between RFP requirements and a company's profile.
+
+    Extract all mandatory qualifications such as:
+    - Required experience
+    - Certifications
+    - Licenses or registrations
+    - Other must-have conditions
+    Use the following historical evaluation guidelines to support your decision:
+    {guidelines}
+
+    ### RFP:
+    {rfp_chunk}
+
+    ### Company Profile:
+    {company_chunk}
+
+    Return:
+    ✅ Met Requirements:
+    - [List with supporting RFP and profile text]
+
+    ❌ Unmet Requirements:
+    - [List with suggestions to fulfill or address each gap]
+    """)
+
+    submission_prompt = PromptTemplate.from_template("""
+    You are a compliance assistant creating a submission checklist based on RFP instructions.
+
+    From the text below, extract:
+    - Document format (e.g., font, layout, margins)
+    - Required attachments
+    - Submission method and deadline
+
+    ### RFP Submission Instructions:
+    {rfp_chunk}
+
+    Return as a checklist.
+    """)
+
+    risk_prompt = PromptTemplate.from_template("""
+    You are a legal risk advisor. Review the RFP clauses and highlight potential risks or biased terms.
     
-    chain = get_conversational_chain()
+    For each, provide:
+    - Clause (quoted or summarized)
+    - Risk Level: Low, Medium, or High
+    - Recommendation to mitigate the risk
 
-    response = chain(
-        {"input_documents": docs, "question": user_question},  
-        return_only_outputs=True
-    )
-    
-    answer = response["output_text"]
-    st.write("Reply: ", answer)
-    
-    return user_question, answer
+    ### RFP Clauses:
+    {rfp_chunk}
+    """)
 
-def save_to_word(questions_answers):
-    doc = Document()
-    doc.add_heading('Question Paper', level=1)
-    
-    for idx, (question, answer) in enumerate(questions_answers, start=1):
-        doc.add_heading(f"Question {idx}:", level=2)
-        doc.add_paragraph(question)
-        doc.add_heading("Answer:", level=2)
-        doc.add_paragraph(answer)
-    
-    file_path = "Question_Paper.docx"
-    doc.save(file_path)
-    st.success(f"Document saved as {file_path}")
-    st.download_button(
-        label="Download Question Paper",
-        data=open(file_path, "rb"),
-        file_name="Question_Paper.docx",
-        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    )
+    eligibility_chain = LLMChain(llm=llm, prompt=eligibility_prompt, verbose=True)
+    gap_chain = LLMChain(llm=llm, prompt=gap_prompt, verbose=True)
+    submission_chain = LLMChain(llm=llm, prompt=submission_prompt, verbose=True)
+    risk_chain = LLMChain(llm=llm, prompt=risk_prompt, verbose=True)
+    with open("evaluation_guidelines.txt", "r") as f:
+        evaluation_guidelines = f.read()
 
-def main():
-    st.set_page_config(page_title="Chat with multiple PDF")
-    st.header("Chat with multiple PDF using Gemini")
+    # Run and display results
+    st.header("🔍 RFP Analysis Results")
 
-    questions_answers = []
-    user_question = st.text_input("Ask a Question from the PDF files")
+    with st.expander("✅ Eligibility & Compliance Checker"):
+        st.info("Analyzing eligibility based on compliance requirements...")
+        with st.spinner("🧠 Evaluating eligibility..."):
+            eligibility_result = eligibility_chain.run({"rfp_chunk": rfp_text, "company_chunk": company_text, "guidelines": evaluation_guidelines})
+        st.write(eligibility_result)
 
-    if user_question:
-        question, answer = user_input(user_question)
-        questions_answers.append((question, answer))
-    
-    with st.sidebar:
-        st.title("Menu:")
-        pdf_docs = st.file_uploader("Upload Your PDF files and Click on Submit Button", accept_multiple_files=True, type=["pdf"])
-        if st.button("Submit & Proceed"):
-            if pdf_docs:
-                with st.spinner("Preprocessing..."):
-                    raw_text = get_pdf_text(pdf_docs)
-                    text_chunks = get_text_chunks(raw_text)
-                    get_vector_store(text_chunks)
-                    st.success("Done")
-            else:
-                st.error("Please upload at least one PDF file.")
-        
-        if st.button("Save to Word"):
-            if questions_answers:
-                save_to_word(questions_answers)
-            else:
-                st.error("No questions and answers to save!")
+    with st.expander("📄 Criteria Extractor & Gap Analyzer"):
+        st.info("Comparing company qualifications to mandatory RFP criteria...")
+        with st.spinner("🧠 Evaluating eligibility..."):
+            gap_result = gap_chain.run({"rfp_chunk": rfp_text, "company_chunk": company_text,"guidelines": evaluation_guidelines})
+        st.write(gap_result)
 
-if __name__ == "__main__":
-    main()
+    with st.expander("📋Submission Checklist Generator"):
+        st.info("Creating checklist from submission instructions...")
+        submission_result = submission_chain.run({"rfp_chunk": rfp_text})
+        st.write(submission_result)
+
+        # # Download button for submission checklist
+        # if submission_result:
+        #     csv_file = "checklist.csv"
+        #     pdf_file = "checklist.pdf"
+
+        #     # Save as CSV
+        #     with open(csv_file, "w",encoding="utf-8") as f:
+        #         f.write(submission_result)
+
+        #     # Save as PDF
+        #     pdf = FPDF()
+        #     pdf.add_page()
+        #     pdf.set_font("Arial", size=12)
+        #     for line in submission_result.splitlines():
+        #         pdf.multi_cell(0, 10, line)
+        #     pdf.output(pdf_file)
+
+        #     st.download_button("📥 Download Checklist (CSV)", data=open(csv_file, "rb",encoding="latin-1"), file_name=csv_file, mime="text/csv")
+        #     st.download_button("📥 Download Checklist (PDF)", data=open(pdf_file, "rb",encoding="latin-1"), file_name=pdf_file, mime="application/pdf")
+
+    with st.expander("⚠️ Risk Analyzer"):
+        st.info("Detecting legal and contractual risks in the RFP...")
+        risk_result = risk_chain.run({"rfp_chunk": rfp_text})
+        st.write(risk_result)
